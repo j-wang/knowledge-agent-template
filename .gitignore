@@ -1,0 +1,8 @@
+.env
+__pycache__/
+
+# Generated search indexes and embeddings
+.similarity.npy
+.embeddings.npz
+.embedding_doc_order.json
+.bm25_cache.pkl
