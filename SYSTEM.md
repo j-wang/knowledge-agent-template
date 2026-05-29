@@ -84,18 +84,37 @@ Concept docs initially have domain-specific keywords. But an analyst might searc
 
 ## Search Infrastructure
 
-### Hybrid BM25 + Semantic Search (`search.py`)
+### Staged Retrieval: BM25 + optional dense + optional rerank (`search.py`)
 
-**Architecture:**
-1. **BM25 layer** — Okapi BM25 with title (3x), tags (2x), keyword (2x) weighting
-2. **Semantic similarity layer** — Precomputed NxN doc-to-doc similarity matrix. For each BM25 hit, surfaces related docs from other domains sharing no query vocabulary
-3. **Result fusion** — ~70% BM25 slots, ~30% reserved for semantic expansion. Both normalized to [0,1] before combining
+**Architecture (each stage past BM25 is opt-in via env config — see
+`retrieval_config.py` / `.env.example` — and degrades gracefully):**
+1. **BM25 layer** (always on, local, no network) — Okapi BM25 with title (3x),
+   tags (2x), keyword (2x) weighting.
+2. **Dense layer** (optional) — if an embedder is configured and
+   `.doc_embeddings.npz` exists, the *query* is embedded and cosine-scored against
+   stored doc vectors. This is true query→doc dense retrieval.
+3. **Fusion** — BM25 and dense ranked lists are combined with **Reciprocal Rank
+   Fusion** (RRF, k=60), not score normalization.
+4. **Rerank layer** (optional) — a cross-encoder / rerank API reorders the top-N
+   fused candidates for precision.
 
-**Two modes for the similarity matrix:**
-- **Neural embeddings (recommended):** `build_embeddings.py` with OpenAI API. Best quality for cross-domain bridging (0.5-0.6 cosine between related cross-domain docs)
-- **TF-IDF fallback:** Built by `search.py --rebuild`. Fully local, no API. Adequate within-domain but weak cross-domain (0.04-0.09 cosine between cross-domain docs)
+**Why the old "semantic expansion" was removed:** earlier versions averaged the
+rows of the doc-to-doc similarity matrix for the top BM25 hits and reserved ~30%
+of result slots for those "related" docs. Benchmarking showed this *regressed*
+ranking versus plain BM25 (it displaced strong lexical hits with loosely-related
+docs). The doc-to-doc matrix is now built and used **only** for the `--related`
+display flag, never for primary ranking.
 
-Both write to `.similarity.npy` — `search.py` loads whichever exists.
+**Providers are pluggable and provider-agnostic** — no model, server, or vendor is
+hardcoded. Embedders: `none` (default) | `openai` (or any OpenAI-compatible
+server) | `tei` | `sentence-transformers`. Rerankers: `none` (default) | `tei` |
+`cohere` | `http`. Selection is by environment variable; the default (`none`/
+`none`) is pure offline BM25.
+
+**Doc-to-doc similarity (`.similarity.npy`, for `--related` only):**
+- With an embed provider: derived from the same doc vectors used for dense retrieval.
+- With `KB_EMBED_PROVIDER=none`: built locally via TF-IDF by `build_embeddings.py`,
+  so `--related` still works fully offline.
 
 ### Why Multi-Pass Retrieval Beats Better Search Infrastructure
 

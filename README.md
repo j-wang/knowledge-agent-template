@@ -16,7 +16,7 @@ The system operates in three layers, each serving a different retrieval purpose:
 | **Theses** | `extracted/concepts/theses/` | Cross-cutting analytical essays threading multiple concepts together (1,500-3,000 words) | 5-10 per source + cross-source |
 | **Source Extractions** | `extracted/sources/` | Raw extracted material for deep dives | Full source content |
 
-Search is hybrid BM25 (keyword) + semantic similarity (TF-IDF or OpenAI embeddings), with a multi-pass retrieval methodology that solves cross-domain vocabulary gaps.
+Search is **BM25 by default** (local, zero-config, no network), with **optional** pluggable dense retrieval (query→doc embeddings, fused with BM25 via Reciprocal Rank Fusion) and an **optional** reranking pass — each enabled purely via environment config. See [Search Infrastructure](#search-infrastructure). A multi-pass retrieval methodology layered on top solves cross-domain vocabulary gaps.
 
 ## Quick Start
 
@@ -41,7 +41,9 @@ Phase 2: Synthesize concept documents → extracted/concepts/docs/
 Phase 3: Generate thesis documents → extracted/concepts/theses/
 Phase 4: Build search index → python3 search.py --rebuild
 Phase 5: Write the PRIMER → extracted/concepts/PRIMER.md
-Phase 6: (Optional) Build neural embeddings → uv run build_embeddings.py
+Phase 6: (Optional but recommended) Add dense retrieval — easiest path is an
+        OpenAI key + text-embedding-3-small; then uv run build_embeddings.py.
+        See "Search Infrastructure" for the one-line .env setup.
 Phase 7: Retrieval test — verify end-to-end quality
 ```
 
@@ -67,7 +69,10 @@ my-domain-knowledge/
 ├── SYSTEM.md                          # Architecture & design rationale
 ├── README.md                          # This file
 ├── search.py                          # Hybrid BM25 + semantic search
-├── build_embeddings.py                # Neural embedding builder (OpenAI API)
+├── build_embeddings.py                # Dense embedding builder (pluggable provider)
+├── retrieval_config.py                # Env-driven retrieval config (all optional)
+├── providers.py                       # Pluggable embed/rerank providers
+├── .env.example                       # Documented config for all providers
 ├── input_docs/                        # Place source materials here
 │   └── (your PDFs, articles, etc.)
 ├── extracted/
@@ -141,32 +146,146 @@ A well-written PRIMER transforms a generic LLM into a domain analyst. Invest tim
 
 ## Search Infrastructure
 
-### BM25 + Semantic Hybrid
+`search.py` runs a staged retrieval pipeline. **Only BM25 is on by default** — the
+dense and rerank stages are opt-in via environment variables, and every optional
+stage **degrades gracefully** (a missing key, an unreachable server, or absent
+embeddings falls back to the next-best available ranking with a one-line stderr
+note — it never crashes).
 
-`search.py` implements hybrid search with:
-- **BM25** with field weighting (title 3x, tags 2x, keywords 2x)
-- **Semantic expansion** via precomputed document similarity matrix
-- **Result fusion** (~70% BM25, ~30% semantic)
+### The pipeline
 
-### Two Similarity Modes
+1. **BM25** (always on) — lexical match over keyword-engineered text, with field
+   weighting (title 3×, tags 2×, keywords 2×). Local, no network, no extra deps.
+2. **Dense retrieval** (optional) — if an embedder is configured **and**
+   `.doc_embeddings.npz` exists, the *query* is embedded and cosine-scored against
+   the stored doc vectors. BM25 and dense lists are fused with **Reciprocal Rank
+   Fusion** (RRF, k=60).
+3. **Reranking** (optional) — if a reranker is configured, the top-N fused
+   candidates (`KB_RERANK_TOP_N`, default 50) are reordered by a cross-encoder /
+   rerank API.
 
-| Mode | Command | Cross-Domain Quality | Requirement |
-|------|---------|---------------------|-------------|
-| **Neural embeddings** (recommended) | `uv run build_embeddings.py` | High (0.5-0.6 cosine) | OpenAI API key |
-| **TF-IDF** (fallback) | `python3 search.py --rebuild` | Low (0.04-0.09 cosine) | None |
+> **Why no "semantic expansion" anymore?** Earlier versions averaged the rows of a
+> doc-to-doc similarity matrix to surface "related" docs as primary results.
+> Benchmarking showed this *hurt* ranking versus plain BM25 (it displaced strong
+> lexical hits with loosely-related docs). It has been removed from the ranking
+> path. True *query→doc* dense retrieval + optional rerank is the actual win. The
+> doc-to-doc matrix is still built and used **only** for the `--related` display
+> flag.
 
-Neural embeddings are worth the API cost if your knowledge base spans multiple sources with different vocabularies.
+### Zero-config (the default)
+
+```bash
+python3 search.py --rebuild     # builds BM25 index + a local TF-IDF doc-doc matrix
+python3 search.py "your query"  # BM25 ranking, fully offline
+```
+
+No API key, no GPU, no network. This is exactly how the template behaves out of
+the box.
+
+### Enabling dense retrieval + reranking
+
+> **Easiest path to good results: an OpenAI API key + `text-embedding-3-small`.**
+> If you don't have a GPU, this is the single lowest-effort upgrade over the
+> default — no server to run, no model to download, just a key. It adds true
+> *query→doc* dense retrieval, and in our benchmarking it gave a clear lift over
+> BM25 alone (most of the gain is in *ranking quality* — how high the right
+> document lands, not just whether it's somewhere in the results). It's also what
+> this template originally shipped with. `text-embedding-3-large` scores slightly
+> higher but costs roughly twice as much for a marginal gain, so `small` is the
+> recommended default.
+>
+> ```bash
+> # .env  — the whole setup
+> KB_EMBED_PROVIDER=openai
+> KB_EMBED_MODEL=text-embedding-3-small
+> OPENAI_KEY=sk-...          # or OPENAI_API_KEY
+> ```
+>
+> **If you have a GPU**, a local `sentence-transformers` model (e.g.
+> `BAAI/bge-m3`) scored best in our benchmark *and* costs nothing per query — but
+> it needs more setup (the model download + enough VRAM). Adding a **reranker**
+> (TEI or Cohere) improves ranking further still, at the cost of a serving
+> dependency and extra per-query latency, so treat it as an optional precision
+> mode rather than a default.
+
+Copy `.env.example` to `.env` and uncomment a provider block (the file documents
+each one). The retriever is **not pinned to any model or server** — you choose:
+
+| Stage | `KB_EMBED_PROVIDER` / `KB_RERANK_PROVIDER` | Notes |
+|-------|--------------------------------------------|-------|
+| Embeddings | `none` (default) | BM25 only |
+| Embeddings | `openai` | OpenAI **or** any OpenAI-compatible `/v1/embeddings` server (`KB_EMBED_ENDPOINT`) |
+| Embeddings | `tei` | HuggingFace text-embeddings-inference (`KB_EMBED_ENDPOINT`) |
+| Embeddings | `sentence-transformers` | Local model (optional dep; install `sentence-transformers`) |
+| Reranking | `none` (default) | no rerank |
+| Reranking | `tei` | TEI rerank endpoint |
+| Reranking | `cohere` | Cohere `/v1/rerank` |
+| Reranking | `http` | Generic: POST `{query, documents}` → list of scores |
+
+Then build the doc embeddings and refresh the index:
+
+```bash
+uv run build_embeddings.py            # embeds the corpus via your provider
+python3 search.py --rebuild --bm25-only
+python3 search.py "your query"        # now BM25 + dense (RRF), + rerank if configured
+```
+
+### Environment variable contract
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `KB_EMBED_PROVIDER` | `none` | `none` \| `openai` \| `tei` \| `sentence-transformers` |
+| `KB_EMBED_MODEL` | — | Provider-specific model id |
+| `KB_EMBED_ENDPOINT` | — | Base URL for an OpenAI-compatible or TEI server |
+| `KB_EMBED_API_KEY` | falls back to `OPENAI_KEY` / `OPENAI_API_KEY` | Embed API key |
+| `KB_EMBED_TIMEOUT` | `10` | Per-request timeout (s) |
+| `KB_EMBED_WAKE_CMD` | — | Shell command to wake an unreachable embed host (e.g. `wakeonlan ..`); then poll + retry |
+| `KB_EMBED_WAKE_TIMEOUT` | `120` | Seconds to wait for the embed host after waking |
+| `KB_RERANK_PROVIDER` | `none` | `none` \| `tei` \| `cohere` \| `http` |
+| `KB_RERANK_MODEL` | — | Provider-specific model id |
+| `KB_RERANK_ENDPOINT` | — | Base URL for the rerank server |
+| `KB_RERANK_API_KEY` | — | Rerank API key |
+| `KB_RERANK_TIMEOUT` | `10` | Per-request timeout (s) |
+| `KB_RERANK_TOP_N` | `50` | How many fused candidates to rerank |
+| `KB_RERANK_WAKE_CMD` | — | Shell command to wake an unreachable rerank host; then poll + retry |
+| `KB_RERANK_WAKE_TIMEOUT` | `120` | Seconds to wait for the rerank host after waking |
+| `KB_RETRIEVAL_MODE` | `auto` | `auto` \| `bm25` \| `dense` \| `hybrid` |
+
+`auto` = hybrid (RRF of BM25 + dense) when doc embeddings are present and an
+embedder is available, otherwise BM25-only. `--bm25-only` on the CLI forces BM25
+regardless of config.
+
+### Graceful-degradation chain
+
+- Reranker configured but unreachable / errors → **skip rerank**, keep fused order.
+- Embedder configured but unreachable, or `.doc_embeddings.npz` missing/stale →
+  **BM25 only**.
+- Endpoint unreachable **and** a `*_WAKE_CMD` is set → run it, poll the endpoint
+  for up to `*_WAKE_TIMEOUT`, then retry once; if it still doesn't come up,
+  fall back as above. (For a self-hosted box that auto-suspends.)
+- `sentence-transformers` selected but not installed → warn once, **BM25 only**.
+- Nothing configured → **BM25 only** (the default), fully offline.
+
+In every case the search still returns results; the only signal is a single
+stderr line noting the fallback.
 
 ## Setup
 
 ### Environment
 
-Copy `.env.sample` to `.env` and add your OpenAI API key (only needed for neural embeddings):
+**No configuration is required** for the default BM25 search. To enable optional
+dense retrieval / reranking, copy `.env.example` to `.env` and uncomment a
+provider block:
 
 ```bash
-cp .env.sample .env
-# Edit .env and set OPENAI_KEY=sk-...
+cp .env.example .env
+# Edit .env — uncomment e.g. the OpenAI, TEI, or sentence-transformers block.
 ```
+
+Every variable is documented in `.env.example` with copy-paste-ready examples for
+OpenAI, a generic TEI endpoint, local sentence-transformers, a Cohere reranker,
+and a TEI reranker. See the [environment variable contract](#environment-variable-contract)
+above.
 
 ### Dependencies
 
@@ -176,15 +295,20 @@ Both Python scripts use [PEP 723](https://peps.python.org/pep-0723/) inline meta
 # Search (also works with plain python3 if deps are installed)
 uv run search.py "query"
 
-# Build embeddings (requires OPENAI_KEY in .env)
+# Build doc embeddings (uses whatever KB_EMBED_PROVIDER you configured;
+# with the default provider=none it builds a local TF-IDF doc-doc matrix)
 uv run build_embeddings.py
 ```
 
-Core dependencies: `numpy`, `rank-bm25`, `scikit-learn`, `scipy`, `pyyaml`, `openai` (for embeddings only).
+Core dependencies stay light: `numpy`, `rank-bm25`, `scikit-learn`, `scipy`. HTTP
+to embedding/rerank servers uses the Python standard library (`urllib`), so no
+extra runtime dependency is required for `openai`/`tei`/`cohere`/`http` providers.
+The `sentence-transformers` provider is an **optional** dependency, imported
+lazily only if you select it (`pip install sentence-transformers`).
 
 ### Search Indexes and Embeddings
 
-The generated index and embedding files (`.similarity.npy`, `.embeddings.npz`, `.embedding_doc_order.json`, `.bm25_cache.pkl`) are excluded from git by default via `.gitignore`. However, once your knowledge base is mature and these files are expensive to recompute, we recommend removing them from `.gitignore` and committing them. This avoids unnecessary recalculation when others fork or specialize your knowledge agent.
+The generated index and embedding files (`.search_index.pkl`, `.similarity.npy`, `.doc_embeddings.npz`, `.tfidf_matrix.npz`) are excluded from git by default via `.gitignore`. However, once your knowledge base is mature and these files are expensive to recompute, we recommend removing them from `.gitignore` and committing them. This avoids unnecessary recalculation when others fork or specialize your knowledge agent.
 
 ## License
 

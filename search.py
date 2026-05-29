@@ -9,21 +9,30 @@
 # ]
 # ///
 """
-Knowledge Base Search — Hybrid BM25 + Semantic Retrieval
+Knowledge Base Search — BM25 + optional dense retrieval + optional reranking.
 
 Domain-agnostic search over a concept/thesis knowledge base.
 
-BM25 handles lexical matching (exact terms, domain jargon).
-Precomputed doc-to-doc similarity handles cross-domain conceptual bridging.
+Retrieval pipeline (all stages past BM25 are opt-in via env config — see
+retrieval_config.py and .env.example):
 
-Similarity matrix can be built two ways:
-  1. Neural embeddings (OpenAI text-embedding-3-small) — run build_embeddings.py
-     on a machine with API access. Best quality for cross-domain bridging.
-  2. TF-IDF fallback — built automatically by --rebuild. Local, no API needed.
-     Good for within-domain similarity but weaker at cross-domain bridging.
+  1. BM25 (rank_bm25) over keyword-engineered text. ALWAYS on, local, no network.
+  2. Dense query->doc retrieval: if an embedder is configured AND
+     `.doc_embeddings.npz` is present, the QUERY is embedded and scored against
+     the stored doc vectors. BM25 and dense lists are fused via Reciprocal Rank
+     Fusion (RRF, k=60).
+  3. Reranking: if a reranker is configured, the top-N fused candidates are
+     reordered by a cross-encoder / rerank API.
 
-search.py auto-detects whichever .similarity.npy exists. Neural embeddings
-overwrite the TF-IDF version when you run build_embeddings.py.
+ZERO CONFIG = BM25 only, fully offline. With KB_EMBED_PROVIDER / KB_RERANK_PROVIDER
+set, the extra stages activate. Every network stage degrades gracefully: if the
+embed/rerank server is down, the doc embeddings are missing, or a key is absent,
+search transparently falls back to the next-best available ranking with a single
+stderr note — it never crashes.
+
+The doc-to-doc `.similarity.npy` matrix is no longer used for primary ranking
+(benchmarks showed the old "semantic expansion" hurt vs plain BM25). It is kept
+ONLY for the `--related` display feature.
 
 Usage:
     python3 search.py "your query here"
@@ -31,7 +40,8 @@ Usage:
     python3 search.py "your query here" --type concepts
     python3 search.py "your query here" --type theses
     python3 search.py "your query here" --verbose
-    python3 search.py "your query here" --related   # show semantically related docs for each hit
+    python3 search.py "your query here" --related   # show related docs for each hit
+    python3 search.py "your query here" --bm25-only  # force BM25, skip dense/rerank
     python3 search.py --rebuild                      # rebuild BM25 index + TF-IDF similarity
     python3 search.py --rebuild --bm25-only          # rebuild BM25 only (skip TF-IDF)
 """
@@ -47,6 +57,9 @@ from pathlib import Path
 import numpy as np
 from rank_bm25 import BM25Okapi
 
+from retrieval_config import load_config
+from providers import get_embedder, get_reranker
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 EXTRACTED_DIR = SCRIPT_DIR / "extracted"
 CONCEPTS_DIR = EXTRACTED_DIR / "concepts" / "docs"
@@ -54,6 +67,10 @@ THESES_DIR = EXTRACTED_DIR / "concepts" / "theses"
 INDEX_PATH = SCRIPT_DIR / ".search_index.pkl"
 SIMILARITY_PATH = SCRIPT_DIR / ".similarity.npy"
 TFIDF_PATH = SCRIPT_DIR / ".tfidf_matrix.npz"
+DOC_EMBEDDINGS_PATH = SCRIPT_DIR / ".doc_embeddings.npz"
+
+# RRF constant. 60 is the canonical default from Cormack et al. (2009).
+RRF_K = 60
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +193,24 @@ def build_bm25(docs: list[dict]) -> BM25Okapi:
 # TF-IDF Semantic Similarity
 # ---------------------------------------------------------------------------
 
+def build_embed_text(doc: dict) -> str:
+    """Build the text to embed for a doc — shared between build_embeddings.py
+    (corpus side) and search.py (so the doc-text representation matches).
+
+    Title (3x weighted by repetition), tags, summary, keywords. Kept identical
+    in spirit to build_tfidf_text so dense and TF-IDF paths see the same fields.
+    The QUERY is embedded raw (no field engineering) at search time.
+    """
+    parts = [doc["title"], doc["title"], doc["title"]]
+    if doc.get("tags"):
+        parts.append("Topics: " + ", ".join(doc["tags"]))
+    if doc.get("summary"):
+        parts.append(doc["summary"])
+    if doc.get("keywords"):
+        parts.append(doc["keywords"])
+    return "\n".join(parts)
+
+
 def build_tfidf_text(doc: dict) -> str:
     """Build the text for TF-IDF vectorization.
 
@@ -294,13 +329,48 @@ def load_index() -> tuple:
 
 
 def load_similarity() -> np.ndarray | None:
-    """Load precomputed similarity matrix if available."""
+    """Load precomputed doc-doc similarity matrix if available.
+
+    Used ONLY for the `--related` display feature now (not primary ranking)."""
     if SIMILARITY_PATH.exists():
         try:
             return np.load(SIMILARITY_PATH)
         except Exception:
             pass
     return None
+
+
+def load_doc_embeddings(docs) -> np.ndarray | None:
+    """Load precomputed normalized doc vectors for dense retrieval.
+
+    Returns an (N, D) float32 matrix aligned to `docs`, or None if the file is
+    missing or doesn't line up with the current index (stale embeddings ->
+    fall back to BM25 rather than mis-rank).
+    """
+    if not DOC_EMBEDDINGS_PATH.exists():
+        return None
+    try:
+        data = np.load(DOC_EMBEDDINGS_PATH, allow_pickle=True)
+        emb = data["embeddings"].astype(np.float32)
+    except Exception as exc:
+        print(f"[retrieval] could not load {DOC_EMBEDDINGS_PATH.name} "
+              f"({type(exc).__name__}) — using BM25 only.", file=sys.stderr)
+        return None
+
+    # Alignment check: prefer doc_ids, fall back to row count.
+    try:
+        stored_ids = [str(x) for x in data["doc_ids"]]
+        current_ids = [str(d.get("id", "")) for d in docs]
+        if stored_ids != current_ids:
+            print("[retrieval] .doc_embeddings.npz is stale (doc set changed) — "
+                  "using BM25 only. Re-run build_embeddings.py.", file=sys.stderr)
+            return None
+    except KeyError:
+        if emb.shape[0] != len(docs):
+            print("[retrieval] .doc_embeddings.npz row count != index — "
+                  "using BM25 only. Re-run build_embeddings.py.", file=sys.stderr)
+            return None
+    return emb
 
 
 # ---------------------------------------------------------------------------
@@ -323,52 +393,136 @@ def search_bm25(query: str, bm25, docs, top_k=10, doc_type=None) -> list:
     return [(s, i) for s, i in results[:top_k] if s > 0]
 
 
-def search_hybrid(query: str, bm25, docs, similarity, top_k=10,
-                   doc_type=None, related=False) -> list:
-    """
-    Hybrid search: BM25 for initial hits, then use similarity matrix to surface
-    cross-domain related docs that BM25 missed.
+def search_bm25_ranked(query: str, bm25, docs, doc_type=None) -> list[int]:
+    """Full BM25 ranking (all docs with score > 0), most-relevant first.
+    Returns a list of doc indices."""
+    tokens = tokenize(query)
+    if not tokens:
+        return []
+    scores = bm25.get_scores(tokens)
+    order = [(scores[i], i) for i in range(len(docs))]
+    if doc_type:
+        order = [(s, i) for s, i in order if docs[i]['type'] == doc_type]
+    order.sort(key=lambda x: -x[0])
+    return [i for s, i in order if s > 0]
 
-    Returns [(score, doc_index, source), ...] where source is 'bm25' or 'semantic'.
-    """
-    # Step 1: BM25 retrieval
-    bm25_results = search_bm25(query, bm25, docs, top_k=top_k * 2, doc_type=doc_type)
 
-    if similarity is None or len(bm25_results) == 0:
-        return [(s, i, 'bm25') for s, i in bm25_results[:top_k]]
-
-    # Step 2: Cross-domain expansion via similarity matrix
-    bm25_indices = set(i for _, i in bm25_results)
-    top_bm25 = [i for _, i in bm25_results[:min(5, len(bm25_results))]]
-    semantic_scores = np.mean(similarity[top_bm25], axis=0)
-
-    # Step 3: Split results — reserve ~30% of slots for semantic expansion
-    n_expansion = max(3, top_k // 3)
-    n_bm25 = top_k - n_expansion
-
-    bm25_out = [(s, i, 'bm25') for s, i in bm25_results[:n_bm25]]
-
-    expansion_pool = []
-    for idx in range(len(docs)):
-        if idx in bm25_indices:
-            continue
-        if doc_type and docs[idx]['type'] != doc_type:
-            continue
-        expansion_pool.append((float(semantic_scores[idx]), idx))
-    expansion_pool.sort(key=lambda x: -x[0])
-    expansion_out = [(s, i, 'semantic') for s, i in expansion_pool[:n_expansion]]
-
-    # Normalize and combine
-    if bm25_out and expansion_out:
-        bm25_max = max(s for s, _, _ in bm25_out) or 1
-        sem_max = max(s for s, _, _ in expansion_out) or 1
-        combined = [(s / bm25_max, i, src) for s, i, src in bm25_out] + \
-                   [(s / sem_max, i, src) for s, i, src in expansion_out]
+def dense_ranked(query: str, embedder, doc_emb, docs, doc_type=None) -> list[int]:
+    """Embed the query, cosine-rank docs. Returns doc indices best-first, or []
+    if the embedder is unavailable / the call fails (caller degrades to BM25)."""
+    if embedder is None or doc_emb is None:
+        return []
+    q = embedder.embed([query])
+    if q is None or len(q) == 0:
+        return []
+    q = np.asarray(q, dtype=np.float32)[0]
+    # doc_emb rows are normalized; normalize the query too -> dot == cosine.
+    qn = np.linalg.norm(q)
+    if qn:
+        q = q / qn
+    sims = doc_emb @ q
+    order = list(np.argsort(-sims))
+    if doc_type:
+        order = [int(i) for i in order if docs[int(i)]['type'] == doc_type]
     else:
-        combined = bm25_out + expansion_out
+        order = [int(i) for i in order]
+    return order
 
-    combined.sort(key=lambda x: -x[0])
-    return combined[:top_k]
+
+def reciprocal_rank_fusion(ranked_lists: list[list[int]], k: int = RRF_K) -> list[tuple[float, int]]:
+    """Reciprocal Rank Fusion (Cormack et al., 2009).
+
+    Each input is a ranked list of item ids (best first). Score for an item is
+    sum over lists of 1 / (k + rank), rank being 1-based. Returns
+    [(score, item_id), ...] sorted by score descending.
+    """
+    scores: dict[int, float] = {}
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked, start=1):
+            scores[item] = scores.get(item, 0.0) + 1.0 / (k + rank)
+    fused = [(s, i) for i, s in scores.items()]
+    fused.sort(key=lambda x: -x[0])
+    return fused
+
+
+def apply_rerank(query: str, reranker, candidates: list[int], docs, top_n: int) -> list[int] | None:
+    """Rerank the top `top_n` candidate doc indices with the reranker.
+
+    Returns the reordered FULL candidate list (reranked head + untouched tail),
+    or None if the reranker is unavailable / fails (caller keeps fused order).
+    """
+    if reranker is None or not candidates:
+        return None
+    head = candidates[:top_n]
+    tail = candidates[top_n:]
+    doc_texts = [build_embed_text(docs[i]) for i in head]
+    scores = reranker.rerank(query, doc_texts)
+    if scores is None or len(scores) != len(head):
+        return None
+    reordered = [i for _, i in sorted(zip(scores, head), key=lambda x: -x[0])]
+    return reordered + tail
+
+
+def search(query: str, bm25, docs, top_k=10, doc_type=None,
+           config=None, embedder=None, reranker=None, doc_emb=None,
+           force_bm25=False) -> list:
+    """Primary retrieval pipeline.
+
+    Returns [(score, doc_index, source), ...] where source ∈
+    {'bm25','dense','hybrid','rerank'} and score is a display-only rank-fusion
+    or BM25 score. Honors config.mode and degrades gracefully at every stage.
+    """
+    if config is None:
+        config = load_config()
+
+    bm25_list = search_bm25_ranked(query, bm25, docs, doc_type=doc_type)
+
+    # Decide effective mode.
+    mode = "bm25" if force_bm25 else config.mode
+    embedder_ok = (not force_bm25 and embedder is not None
+                   and embedder.available() and doc_emb is not None)
+
+    dense_list: list[int] = []
+    if mode in ("auto", "dense", "hybrid") and embedder_ok:
+        dense_list = dense_ranked(query, embedder, doc_emb, docs, doc_type=doc_type)
+
+    # Resolve auto -> concrete mode based on what's actually available.
+    if mode == "auto":
+        mode = "hybrid" if dense_list else "bm25"
+
+    if mode == "dense":
+        if dense_list:
+            ordered = dense_list
+            source = "dense"
+        else:  # dense requested but unavailable -> degrade
+            print("[retrieval] dense mode requested but embeddings unavailable "
+                  "— falling back to BM25.", file=sys.stderr)
+            ordered = bm25_list
+            source = "bm25"
+    elif mode == "hybrid" and dense_list:
+        fused = reciprocal_rank_fusion([bm25_list, dense_list])
+        ordered = [i for _, i in fused]
+        source = "hybrid"
+    else:  # bm25 (explicit, or hybrid with no dense available)
+        ordered = bm25_list
+        source = "bm25"
+
+    # Optional rerank pass over the top-N fused candidates.
+    if (not force_bm25 and reranker is not None and reranker.available()
+            and ordered):
+        reranked = apply_rerank(query, reranker, ordered, docs,
+                                config.rerank.top_n)
+        if reranked is not None:
+            ordered = reranked
+            source = "rerank"
+
+    # Build display scores: descending synthetic score so the ranking is clear.
+    n = len(ordered[:top_k])
+    results = []
+    for rank, idx in enumerate(ordered[:top_k]):
+        score = (n - rank) / n if n else 0.0
+        results.append((score, idx, source))
+    return results
 
 
 def get_related_docs(doc_index: int, docs, similarity, top_k=5) -> list:
@@ -410,7 +564,7 @@ def format_results(results, docs, verbose=False, similarity=None, show_related=F
         doc = docs[idx]
         marker = "T" if doc['type'] == 'thesis' else "C"
         depth = f" [{doc['depth']}]" if doc.get('depth') else ""
-        source_tag = f"  [{source}]" if source == 'semantic' else ""
+        source_tag = f"  [{source}]" if source not in ('bm25', '') else ""
         lines.append(f"{i:2d}. [{marker}] {doc['title']}{depth}  (score: {score:.3f}){source_tag}")
         lines.append(f"    path: {doc['path']}")
         if verbose:
@@ -451,7 +605,8 @@ def main():
                         help="Show semantically related docs for each hit")
     parser.add_argument("--rebuild", action="store_true", help="Rebuild all indexes")
     parser.add_argument("--bm25-only", action="store_true",
-                        help="With --rebuild: skip TF-IDF similarity (preserves existing matrix)")
+                        help="Force BM25-only retrieval (skip dense + rerank). "
+                             "With --rebuild: also skip rebuilding TF-IDF similarity.")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
@@ -473,8 +628,15 @@ def main():
     if args.type:
         doc_type = args.type.rstrip('s')
 
-    results = search_hybrid(args.query, bm25, docs, similarity,
-                            top_k=args.top, doc_type=doc_type)
+    # Wire up the optional dense + rerank stages from env config.
+    config = load_config()
+    embedder = get_embedder(config.embed)
+    reranker = get_reranker(config.rerank)
+    doc_emb = load_doc_embeddings(docs)
+
+    results = search(args.query, bm25, docs, top_k=args.top, doc_type=doc_type,
+                     config=config, embedder=embedder, reranker=reranker,
+                     doc_emb=doc_emb, force_bm25=args.bm25_only)
 
     if args.json:
         out = []

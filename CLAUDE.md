@@ -271,12 +271,23 @@ Use the template at `templates/thesis.md`. Key requirements:
 python3 search.py --rebuild
 ```
 
-This rebuilds the BM25 index and TF-IDF similarity matrix. For higher-quality cross-domain bridging, also run neural embeddings:
+This rebuilds the BM25 index (always on, local, no network) plus a local TF-IDF
+doc-to-doc similarity matrix used for the `--related` display flag. **This alone
+is a complete, working search** — zero config, zero network.
+
+**Optional:** for higher-quality ranking, enable true query→doc dense retrieval
+(BM25 + dense fused via RRF) and/or a rerank pass. These are pluggable and
+provider-agnostic — configure via env (see `.env.example`); nothing is pinned to
+any model or server:
 
 ```bash
-# On a machine with OpenAI API access:
-uv run build_embeddings.py
+cp .env.example .env          # uncomment an embed (and optional rerank) provider
+uv run build_embeddings.py    # embeds the corpus via your provider -> .doc_embeddings.npz
+python3 search.py --rebuild --bm25-only
 ```
+
+Providers degrade gracefully: if the embed/rerank server is unreachable or a key
+is missing, search transparently falls back to BM25 with a one-line stderr note.
 
 ### Step 6: Write the PRIMER
 
@@ -352,7 +363,7 @@ When adding new content:
 1. Extract source material into `extracted/sources/{slug}/`
 2. Generate concept/thesis docs in `extracted/concepts/docs/` and `extracted/concepts/theses/`
 3. Rebuild search index: `python3 search.py --rebuild`
-4. Rebuild neural embeddings: `uv run build_embeddings.py` (if using OpenAI embeddings)
+4. Rebuild dense embeddings: `uv run build_embeddings.py` (only if you've configured an embed provider in `.env`; otherwise this just refreshes the local TF-IDF doc-doc matrix)
 5. Update this file's Status Tracking section
 6. Update the PRIMER if the new source changes what querying agents need to know
 
@@ -380,4 +391,4 @@ These hard-won insights should inform any knowledge base built with this toolkit
 
 9. **Source bias documentation matters.** Every source has a perspective. Documenting it in the Canon section helps querying agents weight and cross-reference information appropriately.
 
-10. **TF-IDF is adequate within-domain but fails cross-domain.** Neural embeddings via OpenAI text-embedding-3-small produce genuinely useful cross-domain similarity (0.5-0.6 cosine for related concepts across domains vs 0.04-0.09 for TF-IDF). Worth the API cost if you have multiple sources with different vocabularies.
+10. **BM25 is the strong zero-config default; dense retrieval improves ranking.** Out of the box, search is BM25-only (local, no network). Enabling an embed provider adds true query→doc dense retrieval, fused with BM25 via RRF — this mainly improves *ranking quality* (getting the right doc to the top), not just recall. An optional rerank pass sharpens precision further. All of it is pluggable (`openai`/`tei`/`sentence-transformers` embedders; `tei`/`cohere`/`http` rerankers) and degrades gracefully back to BM25 if a server is down. The old doc-to-doc "semantic expansion" was removed from ranking — it regressed vs plain BM25 — and the similarity matrix now backs only the `--related` display flag.
