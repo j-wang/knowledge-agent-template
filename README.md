@@ -300,7 +300,7 @@ uv run search.py "query"
 uv run build_embeddings.py
 ```
 
-Core dependencies stay light: `numpy`, `rank-bm25`, `scikit-learn`, `scipy`. HTTP
+Core dependencies stay light: `numpy`, `rank-bm25`, `scikit-learn`. HTTP
 to embedding/rerank servers uses the Python standard library (`urllib`), so no
 extra runtime dependency is required for `openai`/`tei`/`cohere`/`http` providers.
 The `sentence-transformers` provider is an **optional** dependency, imported
@@ -308,7 +308,7 @@ lazily only if you select it (`pip install sentence-transformers`).
 
 ### Search Indexes and Embeddings
 
-The generated index and embedding files (`.search_index.pkl`, `.similarity.npy`, `.doc_embeddings.npz`, `.tfidf_matrix.npz`) are excluded from git by default via `.gitignore`. However, once your knowledge base is mature and these files are expensive to recompute, we recommend removing them from `.gitignore` and committing them. This avoids unnecessary recalculation when others fork or specialize your knowledge agent.
+The generated index and embedding files (`.search_index.pkl`, `.similarity.npy`, `.doc_embeddings.npz`) are excluded from git by default via `.gitignore`. However, once your knowledge base is mature and these files are expensive to recompute, we recommend removing them from `.gitignore` and committing them. This avoids unnecessary recalculation when others fork or specialize your knowledge agent.
 
 ## License
 

@@ -5,7 +5,6 @@
 #     "numpy",
 #     "rank-bm25",
 #     "scikit-learn",
-#     "scipy",
 # ]
 # ///
 """
@@ -46,7 +45,6 @@ Usage:
     python3 search.py --rebuild --bm25-only          # rebuild BM25 only (skip TF-IDF)
 """
 
-import os
 import sys
 import json
 import re
@@ -59,14 +57,15 @@ from rank_bm25 import BM25Okapi
 
 from retrieval_config import load_config
 from providers import get_embedder, get_reranker
+from kb_docs import (
+    load_docs,
+    build_rerank_text,
+    build_tfidf_similarity,
+)
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-EXTRACTED_DIR = SCRIPT_DIR / "extracted"
-CONCEPTS_DIR = EXTRACTED_DIR / "concepts" / "docs"
-THESES_DIR = EXTRACTED_DIR / "concepts" / "theses"
 INDEX_PATH = SCRIPT_DIR / ".search_index.pkl"
 SIMILARITY_PATH = SCRIPT_DIR / ".similarity.npy"
-TFIDF_PATH = SCRIPT_DIR / ".tfidf_matrix.npz"
 DOC_EMBEDDINGS_PATH = SCRIPT_DIR / ".doc_embeddings.npz"
 
 # RRF constant. 60 is the canonical default from Cormack et al. (2009).
@@ -99,79 +98,6 @@ def tokenize(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Document parsing
-# ---------------------------------------------------------------------------
-
-def parse_frontmatter(content: str) -> dict:
-    """Extract YAML frontmatter fields."""
-    fm = {}
-    match = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
-    if not match:
-        return fm
-    raw = match.group(1)
-    for key in ["id", "title", "category", "depth", "type", "analytical_angle", "source"]:
-        m = re.search(rf'^{key}:\s*(.+)', raw, re.MULTILINE)
-        if m:
-            fm[key] = m.group(1).strip().strip('"\'')
-    # Extract tags
-    tags_match = re.search(r'tags:\n((?:\s+-\s+.+\n)+)', raw)
-    if tags_match:
-        fm["tags"] = [t.strip().strip('"\'') for t in re.findall(r'^\s+-\s+(.+)', tags_match.group(1), re.MULTILINE)]
-    return fm
-
-
-def extract_keywords(content: str) -> str:
-    """Pull the Keywords section."""
-    m = re.search(r'## Keywords\n(.+?)(?:\n##|\Z)', content, re.DOTALL)
-    return m.group(1).strip() if m else ""
-
-
-def extract_summary(content: str) -> str:
-    """Pull the Summary section (first 2-3 sentences)."""
-    m = re.search(r'## (?:Summary|Thesis Statement)\n(.+?)(?:\n##)', content, re.DOTALL)
-    if m:
-        text = m.group(1).strip()
-        if len(text) > 300:
-            return text[:300].rsplit(' ', 1)[0] + "..."
-        return text
-    return ""
-
-
-def load_docs() -> list[dict]:
-    """Load all concept and thesis docs with metadata and content."""
-    docs = []
-    for doc_type, directory in [("concept", CONCEPTS_DIR), ("thesis", THESES_DIR)]:
-        if not directory.exists():
-            continue
-        for fname in sorted(os.listdir(directory)):
-            if not fname.endswith('.md') or fname.startswith('_'):
-                continue
-            fpath = directory / fname
-            content = fpath.read_text()
-            fm = parse_frontmatter(content)
-            keywords = extract_keywords(content)
-            summary = extract_summary(content)
-            title = fm.get("title", fname.replace('.md', '').replace('-', ' '))
-            tags = fm.get("tags", [])
-
-            docs.append({
-                "path": str(fpath),
-                "relative_path": f"{doc_type}s/{fname}",
-                "type": doc_type,
-                "id": fm.get("id", fname.replace('.md', '')),
-                "title": title,
-                "category": fm.get("category", fm.get("analytical_angle", "")),
-                "source": fm.get("source", ""),
-                "tags": tags,
-                "summary": summary,
-                "depth": fm.get("depth", ""),
-                "keywords": keywords,
-                "content": content,
-            })
-    return docs
-
-
-# ---------------------------------------------------------------------------
 # BM25 index
 # ---------------------------------------------------------------------------
 
@@ -187,89 +113,6 @@ def build_bm25(docs: list[dict]) -> BM25Okapi:
         )
         corpus.append(tokenize(search_text))
     return BM25Okapi(corpus)
-
-
-# ---------------------------------------------------------------------------
-# TF-IDF Semantic Similarity
-# ---------------------------------------------------------------------------
-
-def build_embed_text(doc: dict) -> str:
-    """Build the text to embed for a doc — shared between build_embeddings.py
-    (corpus side) and search.py (so the doc-text representation matches).
-
-    Title (3x weighted by repetition), tags, summary, keywords. Kept identical
-    in spirit to build_tfidf_text so dense and TF-IDF paths see the same fields.
-    The QUERY is embedded raw (no field engineering) at search time.
-    """
-    parts = [doc["title"], doc["title"], doc["title"]]
-    if doc.get("tags"):
-        parts.append("Topics: " + ", ".join(doc["tags"]))
-    if doc.get("summary"):
-        parts.append(doc["summary"])
-    if doc.get("keywords"):
-        parts.append(doc["keywords"])
-    return "\n".join(parts)
-
-
-def build_tfidf_text(doc: dict) -> str:
-    """Build the text for TF-IDF vectorization.
-
-    Uses title (3x weighted by repetition), tags, summary, and keywords.
-    This mirrors what we'd send to an embedding API but stays fully local.
-    """
-    parts = [
-        doc["title"], doc["title"], doc["title"],  # Title weight boost
-    ]
-    if doc["tags"]:
-        parts.append(" ".join(doc["tags"]))
-        parts.append(" ".join(doc["tags"]))  # Tags double-weighted
-    if doc["summary"]:
-        parts.append(doc["summary"])
-    if doc["keywords"]:
-        parts.append(doc["keywords"])
-    if doc.get("content"):
-        # Include first ~500 chars of body for broader vocabulary
-        parts.append(doc["content"][:500])
-    return "\n".join(parts)
-
-
-def build_tfidf_similarity(docs: list[dict]) -> np.ndarray:
-    """Build TF-IDF vectors and compute cosine similarity matrix.
-
-    Fully local — no API calls. Returns (N, N) similarity matrix.
-    """
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    print(f"Building TF-IDF vectors for {len(docs)} documents...", file=sys.stderr)
-    texts = [build_tfidf_text(doc) for doc in docs]
-
-    # Adapt TF-IDF params for small corpora
-    n_docs = len(docs)
-    min_df = min(2, n_docs) if n_docs > 0 else 1
-    max_df = max(0.8, (n_docs - 0.5) / n_docs) if n_docs > 1 else 1.0
-
-    vectorizer = TfidfVectorizer(
-        max_features=10000,     # Cap vocabulary for efficiency
-        min_df=min_df,          # Term must appear in at least 2 docs (or 1 if small corpus)
-        max_df=max_df,          # Skip terms in >80% of docs (relaxed for small corpus)
-        ngram_range=(1, 2),     # Unigrams and bigrams for phrase matching
-        sublinear_tf=True,      # Dampens raw term frequency
-        stop_words='english',
-    )
-
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    print(f"  Vocabulary: {len(vectorizer.vocabulary_)} terms, matrix: {tfidf_matrix.shape}", file=sys.stderr)
-
-    # Compute cosine similarity
-    print("Computing doc-to-doc similarity matrix...", file=sys.stderr)
-    similarity = cosine_similarity(tfidf_matrix)
-
-    # Save the sparse TF-IDF matrix for potential future use
-    from scipy import sparse
-    sparse.save_npz(TFIDF_PATH, tfidf_matrix)
-
-    return similarity
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +143,9 @@ def build_and_save_index(bm25_only: bool = False):
           file=sys.stderr)
 
     if not bm25_only:
-        similarity = build_tfidf_similarity(docs)
+        print(f"Building TF-IDF doc-to-doc similarity for {len(docs)} documents...",
+              file=sys.stderr)
+        similarity = build_tfidf_similarity(docs, verbose=True)
         np.save(SIMILARITY_PATH, similarity)
         print(f"Saved similarity matrix ({similarity.shape})", file=sys.stderr)
     else:
@@ -328,24 +173,42 @@ def load_index() -> tuple:
     return bm25, stored_docs
 
 
-def load_similarity() -> np.ndarray | None:
+def load_similarity(docs=None) -> np.ndarray | None:
     """Load precomputed doc-doc similarity matrix if available.
 
-    Used ONLY for the `--related` display feature now (not primary ranking)."""
-    if SIMILARITY_PATH.exists():
-        try:
-            return np.load(SIMILARITY_PATH)
-        except Exception:
-            pass
-    return None
+    Used ONLY for the `--related` display feature now (not primary ranking).
+    Returns None (so `--related` is silently skipped) if the file is missing or
+    its shape no longer matches the current corpus — a stale `.similarity.npy`
+    would otherwise crash get_related_docs() with an index error."""
+    if not SIMILARITY_PATH.exists():
+        return None
+    try:
+        sim = np.load(SIMILARITY_PATH)
+    except Exception:
+        return None
+    if docs is not None:
+        n = len(docs)
+        if sim.ndim != 2 or sim.shape != (n, n):
+            print("[retrieval] .similarity.npy is stale (shape != current corpus) "
+                  "— '--related' disabled. Re-run search.py --rebuild.",
+                  file=sys.stderr)
+            return None
+    return sim
 
 
-def load_doc_embeddings(docs) -> np.ndarray | None:
+def load_doc_embeddings(docs, embed_cfg=None) -> np.ndarray | None:
     """Load precomputed normalized doc vectors for dense retrieval.
 
     Returns an (N, D) float32 matrix aligned to `docs`, or None if the file is
-    missing or doesn't line up with the current index (stale embeddings ->
-    fall back to BM25 rather than mis-rank).
+    missing or doesn't line up with the current index/config (stale embeddings
+    -> fall back to BM25 rather than mis-rank or crash).
+
+    Staleness is checked three ways, each of which has bitten us:
+      * doc set changed   -> doc_ids differ (or, legacy files, row count differs)
+      * embed config swap  -> the provider/model recorded in the npz differs from
+        the currently-configured one. Critically, changing KB_EMBED_MODEL to a
+        model with a DIFFERENT vector dimension would otherwise sail past the
+        doc_ids check and blow up later in `doc_emb @ query` with a shape error.
     """
     if not DOC_EMBEDDINGS_PATH.exists():
         return None
@@ -355,6 +218,15 @@ def load_doc_embeddings(docs) -> np.ndarray | None:
     except Exception as exc:
         print(f"[retrieval] could not load {DOC_EMBEDDINGS_PATH.name} "
               f"({type(exc).__name__}) — using BM25 only.", file=sys.stderr)
+        return None
+
+    # Shape sanity: must be a 2-D (N_docs, D) matrix. A 1-D, empty, or
+    # wrong-row-count array (malformed/legacy file) would otherwise crash the
+    # `doc_emb.shape[1]` dim guard or the `doc_emb @ query` matmul downstream.
+    if emb.ndim != 2 or emb.shape[0] != len(docs) or emb.shape[1] == 0:
+        print(f"[retrieval] .doc_embeddings.npz has unexpected shape "
+              f"{emb.shape} for {len(docs)} docs — using BM25 only. "
+              f"Re-run build_embeddings.py.", file=sys.stderr)
         return None
 
     # Alignment check: prefer doc_ids, fall back to row count.
@@ -370,6 +242,25 @@ def load_doc_embeddings(docs) -> np.ndarray | None:
             print("[retrieval] .doc_embeddings.npz row count != index — "
                   "using BM25 only. Re-run build_embeddings.py.", file=sys.stderr)
             return None
+
+    # Config check: provider/model must match what built these vectors. This is
+    # what catches an embed-model swap (and therefore a dimension change).
+    if embed_cfg is not None:
+        try:
+            stored_provider = str(data["provider"])
+            stored_model = str(data["model"])
+        except KeyError:
+            stored_provider = stored_model = None  # legacy npz without metadata
+        if stored_provider is not None:
+            current_model = embed_cfg.model or ""
+            if (stored_provider != embed_cfg.provider
+                    or stored_model != current_model):
+                print(f"[retrieval] .doc_embeddings.npz was built with "
+                      f"provider={stored_provider!r} model={stored_model!r} but "
+                      f"config is provider={embed_cfg.provider!r} "
+                      f"model={current_model!r} — using BM25 only. "
+                      f"Re-run build_embeddings.py.", file=sys.stderr)
+                return None
     return emb
 
 
@@ -393,40 +284,53 @@ def search_bm25(query: str, bm25, docs, top_k=10, doc_type=None) -> list:
     return [(s, i) for s, i in results[:top_k] if s > 0]
 
 
-def search_bm25_ranked(query: str, bm25, docs, doc_type=None) -> list[int]:
+def search_bm25_ranked(query: str, bm25, docs,
+                       doc_type=None) -> tuple[list[int], dict[int, float]]:
     """Full BM25 ranking (all docs with score > 0), most-relevant first.
-    Returns a list of doc indices."""
+    Returns (ordered_indices, {idx: bm25_score})."""
     tokens = tokenize(query)
     if not tokens:
-        return []
+        return [], {}
     scores = bm25.get_scores(tokens)
     order = [(scores[i], i) for i in range(len(docs))]
     if doc_type:
         order = [(s, i) for s, i in order if docs[i]['type'] == doc_type]
     order.sort(key=lambda x: -x[0])
-    return [i for s, i in order if s > 0]
+    ranked = [(s, i) for s, i in order if s > 0]
+    return [i for _, i in ranked], {i: float(s) for s, i in ranked}
 
 
-def dense_ranked(query: str, embedder, doc_emb, docs, doc_type=None) -> list[int]:
-    """Embed the query, cosine-rank docs. Returns doc indices best-first, or []
-    if the embedder is unavailable / the call fails (caller degrades to BM25)."""
+def dense_ranked(query: str, embedder, doc_emb, docs,
+                 doc_type=None) -> tuple[list[int], dict[int, float]]:
+    """Embed the query, cosine-rank docs.
+
+    Returns (ordered_indices_best_first, {idx: cosine}). Returns ([], {}) if the
+    embedder is unavailable, the call fails, or the query/doc vector dimensions
+    don't line up — the dimension guard is the last line of defense behind the
+    config-staleness check so a mismatched embed model degrades to BM25 instead
+    of raising in the matmul.
+    """
     if embedder is None or doc_emb is None:
-        return []
+        return [], {}
     q = embedder.embed([query])
     if q is None or len(q) == 0:
-        return []
+        return [], {}
     q = np.asarray(q, dtype=np.float32)[0]
+    if q.shape[0] != doc_emb.shape[1]:
+        print(f"[retrieval] query embedding dim {q.shape[0]} != doc embedding "
+              f"dim {doc_emb.shape[1]} (stale/mismatched embed model) — "
+              f"using BM25 only. Re-run build_embeddings.py.", file=sys.stderr)
+        return [], {}
     # doc_emb rows are normalized; normalize the query too -> dot == cosine.
     qn = np.linalg.norm(q)
     if qn:
         q = q / qn
     sims = doc_emb @ q
-    order = list(np.argsort(-sims))
+    order = [int(i) for i in np.argsort(-sims)]
     if doc_type:
-        order = [int(i) for i in order if docs[int(i)]['type'] == doc_type]
-    else:
-        order = [int(i) for i in order]
-    return order
+        order = [i for i in order if docs[i]['type'] == doc_type]
+    score_map = {i: float(sims[i]) for i in order}
+    return order, score_map
 
 
 def reciprocal_rank_fusion(ranked_lists: list[list[int]], k: int = RRF_K) -> list[tuple[float, int]]:
@@ -445,22 +349,30 @@ def reciprocal_rank_fusion(ranked_lists: list[list[int]], k: int = RRF_K) -> lis
     return fused
 
 
-def apply_rerank(query: str, reranker, candidates: list[int], docs, top_n: int) -> list[int] | None:
+def apply_rerank(query: str, reranker, candidates: list[int], docs,
+                 top_n: int) -> tuple[list[int], dict[int, float]] | None:
     """Rerank the top `top_n` candidate doc indices with the reranker.
 
-    Returns the reordered FULL candidate list (reranked head + untouched tail),
-    or None if the reranker is unavailable / fails (caller keeps fused order).
+    Docs are presented to the cross-encoder as natural prose (title + summary)
+    via build_rerank_text — feeding the keyword-engineered build_embed_text blob
+    to a prose-trained reranker degrades it.
+
+    Returns (reordered_full_list, {idx: rerank_score for the reranked head}) —
+    the reranked head followed by the untouched tail — or None if the reranker
+    is unavailable / fails (caller keeps fused order).
     """
-    if reranker is None or not candidates:
+    if reranker is None or not candidates or top_n <= 0:
         return None
     head = candidates[:top_n]
     tail = candidates[top_n:]
-    doc_texts = [build_embed_text(docs[i]) for i in head]
+    doc_texts = [build_rerank_text(docs[i]) for i in head]
     scores = reranker.rerank(query, doc_texts)
     if scores is None or len(scores) != len(head):
         return None
-    reordered = [i for _, i in sorted(zip(scores, head), key=lambda x: -x[0])]
-    return reordered + tail
+    paired = sorted(zip(scores, head), key=lambda x: -x[0])
+    reordered = [i for _, i in paired]
+    score_map = {i: float(s) for s, i in paired}
+    return reordered + tail, score_map
 
 
 def search(query: str, bm25, docs, top_k=10, doc_type=None,
@@ -468,14 +380,21 @@ def search(query: str, bm25, docs, top_k=10, doc_type=None,
            force_bm25=False) -> list:
     """Primary retrieval pipeline.
 
-    Returns [(score, doc_index, source), ...] where source ∈
-    {'bm25','dense','hybrid','rerank'} and score is a display-only rank-fusion
-    or BM25 score. Honors config.mode and degrades gracefully at every stage.
+    Returns [(rank_score, doc_index, source, raw_score), ...] where
+      * source ∈ {'bm25','dense','hybrid','rerank'} — the stage that produced
+        THIS row's score (per-row: a reranked head row is 'rerank' while any
+        tail beyond the rerank window keeps its fusion source);
+      * rank_score is a synthetic, display-only value in (0, 1] that is strictly
+        monotonic with the final rank (good for a stable on-screen number);
+      * raw_score is the REAL stage-specific score for that doc (BM25 score /
+        cosine similarity / RRF score / reranker score). Scales differ by source,
+        so `source` tells a programmatic consumer how to interpret raw_score.
+    Honors config.mode and degrades gracefully at every stage.
     """
     if config is None:
         config = load_config()
 
-    bm25_list = search_bm25_ranked(query, bm25, docs, doc_type=doc_type)
+    bm25_list, bm25_scores = search_bm25_ranked(query, bm25, docs, doc_type=doc_type)
 
     # Decide effective mode.
     mode = "bm25" if force_bm25 else config.mode
@@ -483,8 +402,10 @@ def search(query: str, bm25, docs, top_k=10, doc_type=None,
                    and embedder.available() and doc_emb is not None)
 
     dense_list: list[int] = []
+    dense_scores: dict[int, float] = {}
     if mode in ("auto", "dense", "hybrid") and embedder_ok:
-        dense_list = dense_ranked(query, embedder, doc_emb, docs, doc_type=doc_type)
+        dense_list, dense_scores = dense_ranked(query, embedder, doc_emb, docs,
+                                                doc_type=doc_type)
 
     # Resolve auto -> concrete mode based on what's actually available.
     if mode == "auto":
@@ -493,35 +414,50 @@ def search(query: str, bm25, docs, top_k=10, doc_type=None,
     if mode == "dense":
         if dense_list:
             ordered = dense_list
+            raw_map = dense_scores
             source = "dense"
         else:  # dense requested but unavailable -> degrade
             print("[retrieval] dense mode requested but embeddings unavailable "
                   "— falling back to BM25.", file=sys.stderr)
             ordered = bm25_list
+            raw_map = bm25_scores
             source = "bm25"
     elif mode == "hybrid" and dense_list:
         fused = reciprocal_rank_fusion([bm25_list, dense_list])
         ordered = [i for _, i in fused]
+        raw_map = {i: s for s, i in fused}
         source = "hybrid"
     else:  # bm25 (explicit, or hybrid with no dense available)
         ordered = bm25_list
+        raw_map = bm25_scores
         source = "bm25"
 
-    # Optional rerank pass over the top-N fused candidates.
+    # Per-row source so each row's `source` correctly labels the scale of its
+    # `raw_score`. Pre-rerank every row shares the same stage source.
+    src_by_idx = {idx: source for idx in ordered}
+
+    # Optional rerank pass over the top-N candidates. Only the reranked HEAD
+    # gets reranker scores/source; a tail beyond top_n (possible when
+    # top_k > KB_RERANK_TOP_N) keeps its true BM25/dense/hybrid score+source
+    # rather than being mislabeled "rerank".
     if (not force_bm25 and reranker is not None and reranker.available()
             and ordered):
         reranked = apply_rerank(query, reranker, ordered, docs,
                                 config.rerank.top_n)
         if reranked is not None:
-            ordered = reranked
-            source = "rerank"
+            ordered, rerank_scores = reranked
+            raw_map = {**raw_map, **rerank_scores}
+            for idx in rerank_scores:
+                src_by_idx[idx] = "rerank"
 
-    # Build display scores: descending synthetic score so the ranking is clear.
+    # rank_score: synthetic, strictly descending, for a clean display number.
+    # raw_score + source: the real stage-specific score and its origin (per row).
     n = len(ordered[:top_k])
     results = []
     for rank, idx in enumerate(ordered[:top_k]):
-        score = (n - rank) / n if n else 0.0
-        results.append((score, idx, source))
+        rank_score = (n - rank) / n if n else 0.0
+        results.append((rank_score, idx, src_by_idx.get(idx, "bm25"),
+                        raw_map.get(idx, 0.0)))
     return results
 
 
@@ -555,11 +491,7 @@ def format_results(results, docs, verbose=False, similarity=None, show_related=F
 
     lines = []
     for i, item in enumerate(results, 1):
-        if len(item) == 3:
-            score, idx, source = item
-        else:
-            score, idx = item
-            source = 'bm25'
+        score, idx, source = item[0], item[1], (item[2] if len(item) > 2 else 'bm25')
 
         doc = docs[idx]
         marker = "T" if doc['type'] == 'thesis' else "C"
@@ -622,7 +554,7 @@ def main():
         parser.print_help()
         return
 
-    similarity = load_similarity()
+    similarity = load_similarity(docs)
 
     doc_type = None
     if args.type:
@@ -632,7 +564,7 @@ def main():
     config = load_config()
     embedder = get_embedder(config.embed)
     reranker = get_reranker(config.rerank)
-    doc_emb = load_doc_embeddings(docs)
+    doc_emb = load_doc_embeddings(docs, embed_cfg=config.embed)
 
     results = search(args.query, bm25, docs, top_k=args.top, doc_type=doc_type,
                      config=config, embedder=embedder, reranker=reranker,
@@ -641,10 +573,15 @@ def main():
     if args.json:
         out = []
         for item in results:
-            score, idx, source = item if len(item) == 3 else (*item, 'bm25')
+            rank_score, idx, source = item[0], item[1], item[2]
+            raw_score = item[3] if len(item) > 3 else rank_score
             doc = docs[idx]
             entry = {
-                "score": round(score, 4),
+                # Real, stage-specific relevance score (interpret per `source`:
+                # BM25 score / cosine / RRF score / reranker score).
+                "score": round(raw_score, 6),
+                # Synthetic 0..1 value strictly monotonic with rank (display aid).
+                "rank_score": round(rank_score, 4),
                 "path": doc["path"],
                 "type": doc["type"],
                 "id": doc["id"],

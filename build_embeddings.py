@@ -4,7 +4,6 @@
 # dependencies = [
 #     "numpy",
 #     "scikit-learn",
-#     "scipy",
 # ]
 # ///
 """
@@ -40,9 +39,6 @@ sentence-transformers).
 
 from __future__ import annotations
 
-import json
-import os
-import re
 import sys
 from pathlib import Path
 
@@ -50,121 +46,13 @@ import numpy as np
 
 from retrieval_config import load_config
 from providers import get_embedder
+from kb_docs import load_docs, build_embed_text, build_tfidf_similarity
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-CONCEPTS_DIR = SCRIPT_DIR / "extracted" / "concepts" / "docs"
-THESES_DIR = SCRIPT_DIR / "extracted" / "concepts" / "theses"
 SIMILARITY_PATH = SCRIPT_DIR / ".similarity.npy"
 DOC_EMBEDDINGS_PATH = SCRIPT_DIR / ".doc_embeddings.npz"
-TFIDF_PATH = SCRIPT_DIR / ".tfidf_matrix.npz"
 
 EMBED_BATCH = 100
-
-
-# ---------------------------------------------------------------------------
-# Document loading (mirrors search.py logic)
-# ---------------------------------------------------------------------------
-
-def parse_frontmatter(content: str) -> dict:
-    fm = {}
-    match = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
-    if not match:
-        return fm
-    raw = match.group(1)
-    for key in ["id", "title"]:
-        m = re.search(rf'^{key}:\s*(.+)', raw, re.MULTILINE)
-        if m:
-            fm[key] = m.group(1).strip().strip('"\'')
-    tags_match = re.search(r'tags:\n((?:\s+-\s+.+\n)+)', raw)
-    if tags_match:
-        fm["tags"] = [t.strip().strip('"\'') for t in
-                       re.findall(r'^\s+-\s+(.+)', tags_match.group(1), re.MULTILINE)]
-    return fm
-
-
-def extract_section(content: str, header: str, max_chars: int = 500) -> str:
-    m = re.search(rf'## {header}\n(.+?)(?:\n##|\Z)', content, re.DOTALL)
-    if m:
-        text = m.group(1).strip()
-        return text[:max_chars] if len(text) > max_chars else text
-    return ""
-
-
-def load_docs() -> list[dict]:
-    docs = []
-    for doc_type, directory in [("concept", CONCEPTS_DIR), ("thesis", THESES_DIR)]:
-        if not directory.exists():
-            continue
-        for fname in sorted(os.listdir(directory)):
-            if not fname.endswith('.md') or fname.startswith('_'):
-                continue
-            fpath = directory / fname
-            content = fpath.read_text()
-            fm = parse_frontmatter(content)
-            title = fm.get("title", fname.replace('.md', '').replace('-', ' '))
-            tags = fm.get("tags", [])
-            summary = extract_section(content, "(?:Summary|Thesis Statement)", 400)
-            keywords = extract_section(content, "Keywords", 300)
-
-            docs.append({
-                "path": str(fpath),
-                "type": doc_type,
-                "id": fm.get("id", fname.replace('.md', '')),
-                "title": title,
-                "tags": tags,
-                "summary": summary,
-                "keywords": keywords,
-            })
-    return docs
-
-
-def build_embed_text(doc: dict) -> str:
-    """Text to embed for each doc. MUST match search.build_embed_text so the
-    query is scored against the same doc representation."""
-    parts = [doc["title"], doc["title"], doc["title"]]
-    if doc["tags"]:
-        parts.append("Topics: " + ", ".join(doc["tags"]))
-    if doc["summary"]:
-        parts.append(doc["summary"])
-    if doc["keywords"]:
-        parts.append(doc["keywords"])
-    return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# TF-IDF doc-doc similarity (offline fallback for --related)
-# ---------------------------------------------------------------------------
-
-def build_tfidf_text(doc: dict) -> str:
-    parts = [doc["title"], doc["title"], doc["title"]]
-    if doc["tags"]:
-        parts.append(" ".join(doc["tags"]))
-        parts.append(" ".join(doc["tags"]))
-    if doc["summary"]:
-        parts.append(doc["summary"])
-    if doc["keywords"]:
-        parts.append(doc["keywords"])
-    return "\n".join(parts)
-
-
-def build_tfidf_similarity(docs: list[dict]) -> np.ndarray:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    from scipy import sparse
-
-    print(f"Building TF-IDF vectors for {len(docs)} documents...", file=sys.stderr)
-    texts = [build_tfidf_text(doc) for doc in docs]
-    n_docs = len(docs)
-    min_df = min(2, n_docs) if n_docs > 0 else 1
-    max_df = max(0.8, (n_docs - 0.5) / n_docs) if n_docs > 1 else 1.0
-    vectorizer = TfidfVectorizer(
-        max_features=10000, min_df=min_df, max_df=max_df,
-        ngram_range=(1, 2), sublinear_tf=True, stop_words='english',
-    )
-    tfidf_matrix = vectorizer.fit_transform(texts)
-    similarity = cosine_similarity(tfidf_matrix)
-    sparse.save_npz(TFIDF_PATH, tfidf_matrix)
-    return similarity
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +104,7 @@ def main() -> None:
         print("\nKB_EMBED_PROVIDER=none — dense retrieval is DISABLED. "
               "search.py will use BM25 only.")
         print("Building local TF-IDF doc-to-doc similarity for --related...")
-        similarity = build_tfidf_similarity(docs)
+        similarity = build_tfidf_similarity(docs, verbose=True)
         np.save(SIMILARITY_PATH, similarity)
         # A stale .doc_embeddings.npz must not silently enable dense retrieval
         # against the wrong vectors; remove it.
