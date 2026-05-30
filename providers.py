@@ -135,6 +135,27 @@ def _http_post_json(url: str, payload: dict, timeout: float,
         raise
 
 
+# TEI enforces a per-request input cap (`max_client_batch_size`, default 32) and
+# rejects larger requests with HTTP 413. Both the embed and rerank endpoints
+# share that cap, so we discover it once from `{base}/info` and sub-batch under
+# it. Used by TEIEmbedder and TEIReranker.
+TEI_DEFAULT_MAX_BATCH = 32
+
+
+def _tei_max_client_batch(info_url: str | None, timeout: float) -> int:
+    """Read max_client_batch_size from a TEI `/info`; default on any failure."""
+    if not info_url:
+        return TEI_DEFAULT_MAX_BATCH
+    try:
+        req = urllib.request.Request(info_url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            info = json.loads(resp.read().decode())
+        n = int(info.get("max_client_batch_size") or 0)
+        return n if n > 0 else TEI_DEFAULT_MAX_BATCH
+    except Exception:
+        return TEI_DEFAULT_MAX_BATCH
+
+
 # ===========================================================================
 # Embedders
 # ===========================================================================
@@ -200,11 +221,20 @@ class OpenAIEmbedder:
 
 class TEIEmbedder:
     """HuggingFace text-embeddings-inference native API: POST {endpoint}/embed
-    with {"inputs": [...]} -> [[...vec...], ...]."""
+    with {"inputs": [...]} -> [[...vec...], ...].
+
+    TEI enforces a per-request input cap (`max_client_batch_size`, default 32);
+    a request over it is rejected with HTTP 413, which would otherwise fail-soft
+    the entire dense build to BM25. We discover that cap from `{endpoint}/info`
+    (once, cached) and sub-batch transparently, so callers may pass an
+    arbitrarily long `texts` list regardless of the server's limit."""
 
     def __init__(self, cfg: EmbedConfig):
         self.cfg = cfg
-        self.url = (cfg.endpoint or "").rstrip("/") + "/embed" if cfg.endpoint else None
+        base = (cfg.endpoint or "").rstrip("/") if cfg.endpoint else None
+        self.url = base + "/embed" if base else None
+        self.info_url = base + "/info" if base else None
+        self._max_batch: int | None = None
 
     def available(self) -> bool:
         if not self.url:
@@ -214,19 +244,30 @@ class TEIEmbedder:
             return False
         return True
 
+    def _max_client_batch(self) -> int:
+        """Server's max_client_batch_size from /info (cached; default on miss)."""
+        if self._max_batch is None:
+            self._max_batch = _tei_max_client_batch(self.info_url, self.cfg.timeout)
+        return self._max_batch
+
     def embed(self, texts: list[str]):
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
         headers = {}
         if self.cfg.api_key:
             headers["Authorization"] = f"Bearer {self.cfg.api_key}"
+        limit = self._max_client_batch()
         try:
-            body = _http_post_json(
-                self.url, {"inputs": texts}, self.cfg.timeout, headers,
-                wake_cmd=self.cfg.wake_cmd, wake_timeout=self.cfg.wake_timeout,
-            )
-            # TEI returns a bare list of vectors (one per input).
-            return _normalize(np.array(body, dtype=np.float32))
+            rows: list = []
+            for i in range(0, len(texts), limit):
+                body = _http_post_json(
+                    self.url, {"inputs": texts[i:i + limit]}, self.cfg.timeout,
+                    headers, wake_cmd=self.cfg.wake_cmd,
+                    wake_timeout=self.cfg.wake_timeout,
+                )
+                # TEI returns a bare list of vectors (one per input).
+                rows.extend(body)
+            return _normalize(np.array(rows, dtype=np.float32))
         except Exception as exc:  # noqa: BLE001 — fail soft
             _warn("tei_embed_fail",
                   f"embed provider=tei failed ({type(exc).__name__}: {exc}) "
@@ -316,7 +357,10 @@ class TEIReranker:
 
     def __init__(self, cfg: RerankConfig):
         self.cfg = cfg
-        self.url = (cfg.endpoint or "").rstrip("/") + "/rerank" if cfg.endpoint else None
+        base = (cfg.endpoint or "").rstrip("/") if cfg.endpoint else None
+        self.url = base + "/rerank" if base else None
+        self.info_url = base + "/info" if base else None
+        self._max_batch: int | None = None
 
     def available(self) -> bool:
         if not self.url:
@@ -326,23 +370,35 @@ class TEIReranker:
             return False
         return True
 
+    def _max_client_batch(self) -> int:
+        """Server's max_client_batch_size from /info (cached; default on miss)."""
+        if self._max_batch is None:
+            self._max_batch = _tei_max_client_batch(self.info_url, self.cfg.timeout)
+        return self._max_batch
+
     def rerank(self, query: str, docs: list[str]):
         if not docs:
             return []
         headers = {}
         if self.cfg.api_key:
             headers["Authorization"] = f"Bearer {self.cfg.api_key}"
+        limit = self._max_client_batch()
         try:
-            body = _http_post_json(
-                self.url, {"query": query, "texts": docs},
-                self.cfg.timeout, headers,
-                wake_cmd=self.cfg.wake_cmd, wake_timeout=self.cfg.wake_timeout,
-            )
+            # Cross-encoder scores are per-(query,doc) independent, so chunking
+            # under the server cap and merging by index is exact. KB_RERANK_TOP_N
+            # defaults to 50 > the TEI default of 32, so this path is load-bearing.
             scores = [0.0] * len(docs)
-            for item in body:
-                idx = int(item["index"])
-                if 0 <= idx < len(docs):
-                    scores[idx] = float(item["score"])
+            for start in range(0, len(docs), limit):
+                body = _http_post_json(
+                    self.url, {"query": query, "texts": docs[start:start + limit]},
+                    self.cfg.timeout, headers,
+                    wake_cmd=self.cfg.wake_cmd, wake_timeout=self.cfg.wake_timeout,
+                )
+                # TEI returns chunk-local indices; offset back to the global list.
+                for item in body:
+                    idx = start + int(item["index"])
+                    if 0 <= idx < len(docs):
+                        scores[idx] = float(item["score"])
             return scores
         except Exception as exc:  # noqa: BLE001 — fail soft
             _warn("tei_rerank_fail",
