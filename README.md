@@ -124,9 +124,36 @@ These are the hard-won lessons from building the markets-knowledge base at scale
 
 ### Multi-Pass Retrieval Solves Cross-Domain Search
 
-This is the single most important insight. Complex questions span multiple domains, but a single search query only targets one domain's vocabulary. BM25 matches keywords, so a query using Domain A jargon will never surface Domain B material — even when they're deeply related.
+This is the highest-leverage lever for hard, multi-faceted questions. Complex questions span multiple domains, but a single search query only targets one domain's vocabulary. BM25 matches keywords, so a query using Domain A jargon will never surface Domain B material — even when they're deeply related.
 
 **The fix:** Decompose questions into separate searches with domain-appropriate vocabulary, follow cross-references, then search again using vocabulary learned from the first pass. This must be documented in your PRIMER.
+
+**But multi-pass is adaptive, not free — gate it.** Decomposition helps only when a single search *under-retrieves*. On a focused/factual corpus where one query already surfaces the documents the answer needs, decomposing further adds no coverage — only more loosely-related documents, which models then over-synthesize into **fabricated specifics**. We measured this end-to-end (dual-graded): multi-pass lifted answers on a broad analytical corpus (+1 to +1.5 / 10) but *hurt* on a focused factual one (−1.5 to −2.5, via inflated hallucination). The driver is single-shot recall sufficiency, not "difficulty" per se. So make it lazy: **do one broad search first; if it already covers every facet the question names, answer from it and stop; only decompose for facets the first pass left uncovered, and stop when new searches surface nothing new.** Don't decompose a question one query already covers.
+
+### Match Retrieval Machinery to Your Knowledge — More Is Not Always Better
+
+We benchmarked the same pipeline (BM25 → +dense → +reranker) end-to-end across knowledge bases of very different shapes — a broad, cross-domain analytical corpus and a focused, factual policy corpus — grading the actual answers, not just the retrieved documents. The clear lesson: **the right configuration depends on the kind of questions your corpus answers, and adding more stages can make answers *worse*.**
+
+- **Dense retrieval (BM25 + embeddings, fused with RRF) almost always helps.** Across every corpus and question type, fusing semantic search with BM25 improved both the documents retrieved and the final answers. This is the safe default.
+
+- **A reranker only helps narrow, single-document lookups.** A cross-encoder scores each document's relevance to the query *pointwise*, with no sense of how the selected documents complement one another. That's ideal when the answer lives in one document buried under near-misses (a factoid/lookup). But it backfires elsewhere:
+  - On **broad, cross-domain questions** (where a good answer must weave together many documents from different sub-areas), the reranker concentrates the top results on the query's most literal topic and **drops the complementary documents the answer needs** — losing to plain hybrid.
+  - On **factual questions over a focused corpus** (where the answer's facts are spread across several closely-related documents), the reranker still demotes some of those documents — and we observed models then **fabricating the missing facts** to fill the gap. On a factual knowledge base, that is the worst failure mode.
+
+- **So leave the reranker off by default** (this template already does). Turn it on only for genuinely single-document lookups. We tested the usual rescues for broader queries — a diversity-aware step (MMR/DPP) and reranking *per sub-query* inside multi-pass — and, grading the actual answers with two independent graders, **neither recovers a lift**. Diversity-aware reranking at best *ties* plain hybrid (when the answer's documents are topically clustered, the diversity penalty demotes the very complementary documents the answer needs), and per-sub-query reranking inside multi-pass leaves end-to-end answer quality unchanged. "Off by default" is the whole story — reranking buys nothing outside single-document lookups.
+
+- **For hard, multi-faceted questions the highest-leverage lever is multi-pass retrieval, not heavier ranking.** Single-shot retrieval by any method recovers only a fraction of the documents a complex answer needs; decompose the question (above) before reaching for more machinery.
+
+The meta-point: **more retrieval machinery is not automatically better.** A lookup-heavy knowledge base and a synthesis-heavy one want different defaults — match the pipeline to the questions yours actually answers.
+
+### Deploying the querying agent (harness contract)
+
+The adaptive methodology above only works if the *runtime* gives the model the right scaffolding — it's a harness + PRIMER contract, not just a design philosophy:
+
+- **Expose `search`/`getdoc` as first-class tools** — native function calls for API-driven models, or the shell CLI for command-running agents (e.g. Claude Code) — not a hand-rolled "emit `ACTION: …`" text protocol. We measured a local model flailing — repeated/degenerate searches, no final answer — on bare text-parsing, and gating correctly once given proper tool bindings.
+- **Put the coverage rule in the PRIMER** — the document the querying model actually loads (start from `extracted/concepts/PRIMER_TEMPLATE.md`). Keep it procedural (named-asks → stop) for smaller / local models.
+- **Add code-level guardrails** so the model's judgment isn't the only safeguard: a hard cap on total searches (~10–12) to force convergence; dedup of near-identical queries (kills runaway re-search loops); and a fallback to a stronger model on an empty / low-confidence answer.
+- **Model routing:** a strong local model can *drive* this loop (decompose **and** exercise restraint) given native tools + the procedural rule + guardrails — not just synthesize over a fixed context. Pair it with a frontier-model fallback for the cases the guardrails catch.
 
 ### Fine-Grained Concepts with Deliberate Overlap
 
@@ -300,7 +327,7 @@ uv run search.py "query"
 uv run build_embeddings.py
 ```
 
-Core dependencies stay light: `numpy`, `rank-bm25`, `scikit-learn`, `scipy`. HTTP
+Core dependencies stay light: `numpy`, `rank-bm25`, `scikit-learn`. HTTP
 to embedding/rerank servers uses the Python standard library (`urllib`), so no
 extra runtime dependency is required for `openai`/`tei`/`cohere`/`http` providers.
 The `sentence-transformers` provider is an **optional** dependency, imported
@@ -308,7 +335,7 @@ lazily only if you select it (`pip install sentence-transformers`).
 
 ### Search Indexes and Embeddings
 
-The generated index and embedding files (`.search_index.pkl`, `.similarity.npy`, `.doc_embeddings.npz`, `.tfidf_matrix.npz`) are excluded from git by default via `.gitignore`. However, once your knowledge base is mature and these files are expensive to recompute, we recommend removing them from `.gitignore` and committing them. This avoids unnecessary recalculation when others fork or specialize your knowledge agent.
+The generated index and embedding files (`.search_index.pkl`, `.similarity.npy`, `.doc_embeddings.npz`) are excluded from git by default via `.gitignore`. However, once your knowledge base is mature and these files are expensive to recompute, we recommend removing them from `.gitignore` and committing them. This avoids unnecessary recalculation when others fork or specialize your knowledge agent.
 
 ## License
 

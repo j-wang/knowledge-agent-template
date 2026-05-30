@@ -56,8 +56,8 @@ Full markdown extractions from original source material. These contain raw text,
 The intended retrieval flow for a querying agent:
 
 1. **Load the primer** — orients the agent's analytical framework
-2. **Decompose complex questions** into distinct analytical components
-3. **Search each component separately** with domain-appropriate vocabulary
+2. **Start with one broad search; decompose only if it leaves facets uncovered** — lazy multi-pass. Don't decompose a question one query already covers (over-retrieval pulls in loosely-related docs that get synthesized into fabricated specifics).
+3. **Search each uncovered component separately** with domain-appropriate vocabulary; stop when new searches surface nothing new
 4. **Read concept docs** (5-15 relevant), follow cross-references
 5. **Search thesis docs** for analytical depth across concepts
 6. **Go to source docs if needed** — for specific data, charts, deeper detail
@@ -120,7 +120,7 @@ server) | `tei` | `sentence-transformers`. Rerankers: `none` (default) | `tei` |
 
 The single most important retrieval insight: no search infrastructure — not embeddings, not TF-IDF, not RRF — can overcome the vocabulary gap between source domains in a single query. Neural embeddings correctly rank same-domain docs higher than cross-domain docs because they *are* more relevant to any single-domain query.
 
-The fix is in how agents use search, not in search itself. Complex questions need decomposition into separate searches, each with domain-appropriate vocabulary. This is documented in the PRIMER so querying agents learn to do it.
+The fix is in how agents use search, not in search itself. Complex questions need decomposition into separate searches, each with domain-appropriate vocabulary. This is documented in the PRIMER so querying agents learn to do it — **applied adaptively**: decompose only when one broad search leaves facets uncovered, since over-decomposing a question already covered by a single query only adds loosely-related docs that inflate fabrication (see CLAUDE.md "Multi-Pass Retrieval" for the lazy/gap-filling rule).
 
 ## Maintenance
 

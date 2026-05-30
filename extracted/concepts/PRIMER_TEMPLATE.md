@@ -27,42 +27,54 @@ Full extractions from original materials in `sources/`. Use when you need depth 
 
 ## How to Search This Knowledge Base
 
-**Use `search.py` for retrieval:**
+You have **two retrieval operations**. They are the contract — everything below assumes only these two:
 
+| Operation | What it does | Parameters |
+|---|---|---|
+| **search** | ranked hybrid (keyword + semantic) search; returns id, title, snippet, cross-references | `query` (required) · `top` (default 10) · `type` = `concepts` \| `theses` (optional) · `related` = also list semantically-similar docs per hit (optional) |
+| **getdoc** | return the full text of one document | `id` (required) |
+
+Your runtime exposes these in **one of two ways — use whichever your environment gives you** (you do not need both, and you should not assume one without checking):
+
+**A. Shell CLI** — for agents that can run commands (e.g. Claude Code):
 ```bash
-# Basic search
-python3 search.py "your query terms" --top 10 -v
-
-# With semantically related docs shown per hit
-python3 search.py "your query" --top 10 -v --related
-
-# Filter by type
-python3 search.py "your query" --type theses
-
-# JSON output for programmatic use
-python3 search.py "your query" --json
+python3 search.py "your query terms" --top 10 -v          # search
+python3 search.py "your query" --top 10 -v --related      # search + semantic neighbors per hit
+python3 search.py "your query" --type theses              # filter to one layer
+python3 search.py "your query" --json                     # machine-readable output
+cat extracted/concepts/docs/<id>.md                       # getdoc: read a full document
+#   (theses live in extracted/concepts/theses/<id>.md)
 ```
 
-The `--related` flag is valuable — it shows documents semantically similar to each hit, surfacing cross-domain connections you wouldn't find by keyword alone.
+**B. Native tool calls** — for API-driven models given function-calling tools:
+```
+search({"query": "...", "top": 10, "type": "theses", "related": true})   # → ranked results
+getdoc({"doc_id": "..."})                                                 # → full document text
+```
+These must be wired as **first-class tools** by your harness. Do **not** drive them through a hand-rolled "emit `ACTION: …`" text protocol — a model parsing its own text output over-searches and fails to converge. If neither binding (A nor B) is present, your harness is not set up: stop and see the deployment contract in `README.md` before querying.
 
-### Multi-Pass Retrieval (Critical)
+The **related / semantic-neighbor** option is valuable — it surfaces cross-domain connections you wouldn't find by keyword alone.
 
-**Do not rely on a single search query.** Complex analytical questions have multiple facets, and each facet may require its own search. This is especially important when a question spans different source domains.
+### Multi-Pass Retrieval (Adaptive — gate it)
 
-The pattern:
-1. **Decompose the question** into its distinct analytical components
-2. **Search each component separately** with domain-appropriate vocabulary
-3. **Follow cross-references** in the docs you find
-4. **Search again** based on what you learned — the first pass teaches you the vocabulary of the knowledge base
+Decomposing a question into several searches is the **highest-leverage lever for hard, multi-faceted questions** — but it is **not free, so apply it adaptively.** Decomposition only helps when a single search *under-retrieves*. If you decompose a question that one broad query already covers, the extra searches pull in loosely-related documents — and the danger is what you then do with them: padding an answer with marginally-relevant material leads to **fabricated specifics** (you synthesize details the docs don't actually support). On a focused/factual knowledge base this *hurts* answer quality; on a broad analytical one it helps. So gate decomposition on **retrieval completeness, not on how "hard" the question feels.**
+
+**The lazy / gap-filling pattern:**
+1. **Start with one broad search** for the question as asked.
+2. **Assess coverage.** For every facet the question names, did the results surface a relevant doc *with tight relevance*? (Concretely: each named facet has at least one hit that is clearly on-topic for it, not just adjacent.) If yes → **stop and answer. Do not decompose further.**
+3. **Decompose only the gaps.** For each facet left uncovered, run a separate search with vocabulary appropriate to that domain.
+4. **Follow cross-references** in the docs you find.
+5. **Search again** with vocabulary learned from the first passes — and **stop when new searches stop surfacing new relevant docs** (retrieval has saturated).
+6. **Synthesize** across everything retrieved.
+
+The signal is single-shot recall *sufficiency*: decompose when one query leaves facets uncovered; don't when it already has them.
 
 **Example:** "{Example complex question spanning two domains}"
 
-This has two components requiring separate searches:
-- **Component A:** Search "{domain A terms}" → finds concepts about A
-- **Component B:** Search "{domain B terms}" → finds concepts about B
-- **Bridging:** After reading both sets, search for connecting themes → finds thesis linking them
+- **One broad search first.** If it already returns on-topic docs for *both* domain A and domain B, answer from them — you're done.
+- **If a facet is missing** (e.g. the broad query only surfaced domain A material): search "{domain B terms}" to fill that gap, then search bridging themes discovered in both sets → finds the thesis linking them.
 
-A single combined query would only find one domain's material. Multi-pass retrieval closes this gap.
+A single combined query often can't reach a second domain's vocabulary at all — that's the gap multi-pass closes. But reach for it only when the first pass demonstrably left a facet uncovered, not reflexively.
 
 ### Search Tips
 

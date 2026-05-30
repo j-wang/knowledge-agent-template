@@ -303,25 +303,31 @@ The primer is the most important document in the entire system — it's what tra
 
 ## Multi-Pass Retrieval (Critical Methodology)
 
-This is the single most important retrieval insight from testing.
+This is the highest-leverage retrieval lever for hard, multi-faceted questions — applied **adaptively** (see the gating rule below).
 
 **Problem:** Complex questions span multiple domains. A single search query can only target one domain's vocabulary. BM25 matches keywords, so a query about Topic A will never surface material from Topic B if the two domains use different jargon — even if they're conceptually related.
 
-**Solution:** Decompose complex questions into separate searches, each with domain-appropriate vocabulary.
+**Solution:** Decompose complex questions into separate searches — **but adaptively**. Decomposition only helps when a single search *under-retrieves*. Over-decomposing a question that one query already covers pulls in loosely-related docs that models then synthesize into **fabricated specifics** (measured end-to-end: it *hurt* answers on a focused factual corpus by 1.5–2.5 / 10 via inflated hallucination, while helping a broad analytical one). So gate decomposition on retrieval completeness.
 
-**Pattern:**
-1. **Decompose the question** into distinct analytical components
-2. **Search each component separately** with vocabulary appropriate to that domain
-3. **Follow cross-references** in the docs you find
-4. **Search again** using vocabulary learned from the first pass
-5. **Synthesize** across all retrieved material
+**Pattern (lazy / gap-filling):**
+1. **Start with one broad search** for the question as asked.
+2. **Assess coverage** — do the results already surface a relevant doc for every facet the question names, with tight relevance? If yes, **stop and answer — do NOT decompose further.**
+3. **Decompose only the gaps** — for each facet left uncovered, search separately with vocabulary appropriate to that domain.
+4. **Follow cross-references** in the docs you find.
+5. **Search again** with vocabulary learned from the first passes, and **stop when new searches stop surfacing new relevant docs** (retrieval has saturated).
+6. **Synthesize** across all retrieved material.
+
+The signal is single-shot recall *sufficiency*, not question "difficulty": decompose when one query leaves facets uncovered; don't when it already has them.
 
 **Example:** "How does X in Domain A relate to Y in Domain B?"
 - Search 1: Domain A terms for X → finds concepts A1, A2, A3
 - Search 2: Domain B terms for Y → finds concepts B1, B2, B3
 - Search 3: Bridging terms discovered in A1-A3 and B1-B3 → finds thesis T1 connecting them
 
-This must be documented in the PRIMER so querying agents learn to do it.
+This must be documented in the PRIMER so querying agents learn to do it. Start from `extracted/concepts/PRIMER_TEMPLATE.md`, which already encodes the adaptive coverage check. Two notes that make or break this in practice:
+
+- **Keep the coverage rule procedural for smaller / local models.** Larger models infer "stop when covered" from terse guidance; smaller ones (e.g. a local ~27B) need the explicit named-asks form — *list what the question asks for; if each is hit, STOP; do not search adjacent topics.* The template's version is already procedural; keep it that way when you fill it in.
+- **The methodology only fires with a real tool-calling harness.** Expose `search`/`getdoc` as first-class tools — **native function calls** for API-driven models, or the **shell CLI** for command-running agents (e.g. Claude Code) — not a hand-rolled "emit `ACTION:`" text protocol, which makes local models over-search and fail to converge. See the deployment contract in `README.md`.
 
 ---
 

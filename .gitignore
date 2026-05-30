@@ -8,4 +8,3 @@ __pycache__/
 .embedding_doc_order.json
 .bm25_cache.pkl
 .search_index.pkl
-.tfidf_matrix.npz
