@@ -30,8 +30,9 @@ For full design rationale, see **SYSTEM.md**. Summary:
 {project}/
 ├── CLAUDE.md                          # This file — methodology & status
 ├── SYSTEM.md                          # Architecture & design rationale
-├── search.py                          # Hybrid BM25 + semantic search
-├── build_embeddings.py                # Neural embedding builder (OpenAI API)
+├── search.py                          # Thin shim → kb_engine (keeps `python3 search.py`)
+├── build_embeddings.py                # Thin shim → kb_engine (dense build, provider-driven)
+├── engine/kb_engine/                  # Shared retrieval engine (installable as kb-engine)
 ├── input_docs/                        # Place raw source materials here (PDFs, articles, etc.)
 ├── extracted/
 │   ├── concepts/

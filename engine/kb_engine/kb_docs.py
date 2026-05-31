@@ -19,9 +19,10 @@ import os
 import re
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-CONCEPTS_DIR = SCRIPT_DIR / "extracted" / "concepts" / "docs"
-THESES_DIR = SCRIPT_DIR / "extracted" / "concepts" / "theses"
+from ._root import KB_ROOT
+
+CONCEPTS_DIR = KB_ROOT / "extracted" / "concepts" / "docs"
+THESES_DIR = KB_ROOT / "extracted" / "concepts" / "theses"
 
 # Canonical truncation. One value, used identically at build and query time.
 SUMMARY_MAX_CHARS = 400

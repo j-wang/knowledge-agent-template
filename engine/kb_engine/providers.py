@@ -32,7 +32,7 @@ import urllib.request
 
 import numpy as np
 
-from retrieval_config import EmbedConfig, RerankConfig
+from .retrieval_config import EmbedConfig, RerankConfig
 
 # Track which warnings we've already emitted so a 762-query run doesn't print
 # the same "endpoint unreachable" line hundreds of times.

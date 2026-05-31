@@ -1,0 +1,16 @@
+[project]
+name = "kb-engine"
+version = "1.0.0"
+description = "Domain-agnostic retrieval engine for knowledge agents (BM25 + dense RRF, pluggable providers)."
+requires-python = ">=3.10"
+dependencies = ["numpy", "rank-bm25", "scikit-learn"]
+
+[project.optional-dependencies]
+sentence-transformers = ["sentence-transformers"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kb_engine"]
