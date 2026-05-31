@@ -68,10 +68,11 @@ my-domain-knowledge/
 ├── CLAUDE.md                          # Agent instructions (the methodology)
 ├── SYSTEM.md                          # Architecture & design rationale
 ├── README.md                          # This file
-├── search.py                          # Hybrid BM25 + semantic search
-├── build_embeddings.py                # Dense embedding builder (pluggable provider)
-├── retrieval_config.py                # Env-driven retrieval config (all optional)
-├── providers.py                       # Pluggable embed/rerank providers
+├── search.py                          # Thin shim → kb_engine (keeps `python3 search.py`)
+├── build_embeddings.py                # Thin shim → kb_engine
+├── engine/                            # Shared retrieval engine — installable as `kb-engine`
+│   ├── pyproject.toml                 #   package metadata + deps
+│   └── kb_engine/                     #   search · build_embeddings · kb_docs · providers · retrieval_config
 ├── .env.example                       # Documented config for all providers
 ├── input_docs/                        # Place source materials here
 │   └── (your PDFs, articles, etc.)
@@ -154,6 +155,30 @@ The adaptive methodology above only works if the *runtime* gives the model the r
 - **Put the coverage rule in the PRIMER** — the document the querying model actually loads (start from `extracted/concepts/PRIMER_TEMPLATE.md`). Keep it procedural (named-asks → stop) for smaller / local models.
 - **Add code-level guardrails** so the model's judgment isn't the only safeguard: a hard cap on total searches (~10–12) to force convergence; dedup of near-identical queries (kills runaway re-search loops); and a fallback to a stronger model on an empty / low-confidence answer.
 - **Model routing:** a strong local model can *drive* this loop (decompose **and** exercise restraint) given native tools + the procedural rule + guardrails — not just synthesize over a fixed context. Pair it with a frontier-model fallback for the cases the guardrails catch.
+
+### Sharing the engine across derivative agents
+
+The retrieval engine lives in `engine/` as an installable package (`kb-engine`); the root `search.py` / `build_embeddings.py` are thin shims that import it. This lets every derivative agent share **one** engine and sync by version bump, instead of vendoring (and drifting) copies.
+
+The engine is location-independent: it reads the corpus (`extracted/`), config (`.env`), and index artifacts from **`KB_ROOT`** (the env var the shim sets to its own directory; defaults to the cwd). Only corpus, PRIMER, and `.env` differ per agent — the engine code is identical everywhere.
+
+- **In this template repo**, the shims load the engine from the local `engine/` dir (so you can iterate on it) and set `KB_ROOT` to the repo root.
+- **In a derivative agent**, replace each shim's dependency block with the published package pinned to a tag, and drop the local `sys.path` line:
+
+  ```python
+  # /// script
+  # requires-python = ">=3.10"
+  # dependencies = [
+  #   "kb-engine @ git+ssh://git@github.com/j-wang/knowledge-agent-template.git@engine-v1#subdirectory=engine",
+  # ]
+  # ///
+  import os, pathlib
+  os.environ.setdefault("KB_ROOT", str(pathlib.Path(__file__).resolve().parent))
+  from kb_engine.search import main
+  main()
+  ```
+
+  `uv run search.py …` then resolves the engine from git, and `KB_ROOT` keeps it operating on the agent's own corpus. **To roll an engine improvement out to every agent, bump the pinned tag** (`@engine-v1` → `@engine-v2`) in each agent's two shims — no code copying, no drift.
 
 ### Fine-Grained Concepts with Deliberate Overlap
 

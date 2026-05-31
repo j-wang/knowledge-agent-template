@@ -51,8 +51,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).parent.resolve()
-ENV_PATH = SCRIPT_DIR / ".env"
+from ._root import KB_ROOT
+
+# The agent's .env lives in its KB root (the dir the shim points KB_ROOT at),
+# NOT next to the installed package — so a pip-installed engine still reads the
+# consuming agent's retrieval config.
+ENV_PATH = KB_ROOT / ".env"
 
 # Valid choices (kept here so other modules can validate / message consistently)
 EMBED_PROVIDERS = ("none", "openai", "tei", "sentence-transformers")
