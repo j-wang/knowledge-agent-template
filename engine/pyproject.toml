@@ -1,6 +1,6 @@
 [project]
 name = "kb-engine"
-version = "1.0.0"
+version = "1.1.0"
 description = "Domain-agnostic retrieval engine for knowledge agents (BM25 + dense RRF, pluggable providers)."
 requires-python = ">=3.10"
 dependencies = ["numpy", "rank-bm25", "scikit-learn"]

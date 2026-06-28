@@ -130,7 +130,11 @@ def build_and_save_index(bm25_only: bool = False):
 
     n_concepts = sum(1 for d in stored_docs if d['type'] == 'concept')
     n_theses = sum(1 for d in stored_docs if d['type'] == 'thesis')
-    print(f"Indexed {len(stored_docs)} documents ({n_concepts} concepts, {n_theses} theses)",
+    n_sources = sum(1 for d in stored_docs if d['type'] == 'source')
+    parts = f"{n_concepts} concepts, {n_theses} theses"
+    if n_sources:
+        parts += f", {n_sources} sources"
+    print(f"Indexed {len(stored_docs)} documents ({parts})",
           file=sys.stderr)
 
     if not bm25_only:
@@ -485,7 +489,7 @@ def format_results(results, docs, verbose=False, similarity=None, show_related=F
         score, idx, source = item[0], item[1], (item[2] if len(item) > 2 else 'bm25')
 
         doc = docs[idx]
-        marker = "T" if doc['type'] == 'thesis' else "C"
+        marker = {"thesis": "T", "source": "S"}.get(doc['type'], "C")
         depth = f" [{doc['depth']}]" if doc.get('depth') else ""
         source_tag = f"  [{source}]" if source not in ('bm25', '') else ""
         lines.append(f"{i:2d}. [{marker}] {doc['title']}{depth}  (score: {score:.3f}){source_tag}")
@@ -522,7 +526,7 @@ def main():
     parser = argparse.ArgumentParser(description="Search the Knowledge Base")
     parser.add_argument("query", nargs="?", help="Search query")
     parser.add_argument("--top", type=int, default=10, help="Number of results (default: 10)")
-    parser.add_argument("--type", choices=["concepts", "theses"], help="Filter by doc type")
+    parser.add_argument("--type", choices=["concepts", "theses", "sources"], help="Filter by doc type")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show extra detail")
     parser.add_argument("--related", "-r", action="store_true",
                         help="Show semantically related docs for each hit")
@@ -549,7 +553,8 @@ def main():
 
     doc_type = None
     if args.type:
-        doc_type = args.type.rstrip('s')
+        doc_type = {"concepts": "concept", "theses": "thesis",
+                    "sources": "source"}[args.type]
 
     # Wire up the optional dense + rerank stages from env config.
     config = load_config()

@@ -23,6 +23,14 @@ from ._root import KB_ROOT
 
 CONCEPTS_DIR = KB_ROOT / "extracted" / "concepts" / "docs"
 THESES_DIR = KB_ROOT / "extracted" / "concepts" / "theses"
+SOURCES_DIR = KB_ROOT / "extracted" / "sources"
+
+# Opt-in: also index the raw source corpus (extracted/sources/**), not just the
+# curated concepts/theses layer. OFF by default so agents that only want the
+# curated layer are unaffected. Agents whose value is in searchable raw sources
+# (e.g. ferretto-canon's Trello deal cards + pulled docs) set KB_INDEX_SOURCES=true
+# in their .env. BM25 tokenizes full content, so sources need no frontmatter to be
+# findable.
 
 # Canonical truncation. One value, used identically at build and query time.
 SUMMARY_MAX_CHARS = 400
@@ -86,6 +94,22 @@ def extract_keywords(content: str) -> str:
 # Document loading
 # ---------------------------------------------------------------------------
 
+def _index_sources_enabled() -> bool:
+    """Whether to index the raw sources corpus. Reads KB_INDEX_SOURCES from the
+    environment, falling back to the agent's .env at KB_ROOT (so it works whether
+    or not the caller has already loaded the dotenv). Default False."""
+    val = os.environ.get("KB_INDEX_SOURCES")
+    if val is None:
+        env_path = KB_ROOT / ".env"
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("KB_INDEX_SOURCES="):
+                    val = line.split("=", 1)[1].strip().strip('"\'')
+                    break
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+
 def load_docs(concepts_dir: Path = CONCEPTS_DIR,
               theses_dir: Path = THESES_DIR) -> list[dict]:
     """Load all concept and thesis docs with metadata and full content.
@@ -111,6 +135,38 @@ def load_docs(concepts_dir: Path = CONCEPTS_DIR,
                 "relative_path": f"{doc_type}s/{fname}",
                 "type": doc_type,
                 "id": fm.get("id", fname.replace('.md', '')),
+                "title": title,
+                "category": fm.get("category", fm.get("analytical_angle", "")),
+                "source": fm.get("source", ""),
+                "tags": fm.get("tags", []),
+                "summary": extract_summary(content),
+                "depth": fm.get("depth", ""),
+                "keywords": extract_keywords(content),
+                "content": content,
+            })
+
+    # Optional: raw sources corpus (extracted/sources/**). Walked recursively and
+    # appended AFTER concepts/theses, sorted by path, so the row order stays
+    # deterministic across the BM25 index, dense vectors, and similarity matrix.
+    if _index_sources_enabled() and SOURCES_DIR.exists():
+        extracted_root = KB_ROOT / "extracted"
+        for fpath in sorted(SOURCES_DIR.rglob("*.md"), key=lambda p: str(p)):
+            name = fpath.name
+            if name.startswith('_'):
+                continue
+            # skip the raw attachment dir (binaries / gitignored dumps), but KEEP
+            # _attachments_extracted (the searchable text pulled from those files)
+            if "_attachments" in fpath.parts:
+                continue
+            rel = str(fpath.relative_to(extracted_root))  # e.g. sources/trello/.../card.md
+            content = fpath.read_text(errors="replace")
+            fm = parse_frontmatter(content)
+            title = fm.get("title", name.replace('.md', '').replace('-', ' '))
+            docs.append({
+                "path": str(fpath),
+                "relative_path": rel,
+                "type": "source",
+                "id": fm.get("id", rel[:-3].replace('/', '_')),
                 "title": title,
                 "category": fm.get("category", fm.get("analytical_angle", "")),
                 "source": fm.get("source", ""),
